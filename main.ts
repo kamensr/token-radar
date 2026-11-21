@@ -1,12 +1,12 @@
 // Token Radar, a token-radar-01 entry (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores
-// every rankable pre-token protocol with the calibrated model in lib/model.ts, writes the ranked board
+// every rankable pre-token protocol with the peer-fitted model in lib/model.ts, writes the ranked board
 // to /output/board.json and the dashboard's dataset to /output/data.js, copies this repository's
 // dashboard/ and screenshots/ to /output, and writes /output/dossier.json, the summary the judge
 // reads, with the vendored make.fun library.
 //
-// The run is deterministic: the model is a pure function of the snapshot, the board is sorted by
+// The run is deterministic: the robust peer fit is a pure function of the snapshot, the board is sorted by
 // implied value with the slug as the tiebreak, and no clock, random number or network call is read.
 // Run it twice and the bytes match.
 //

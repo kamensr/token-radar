@@ -49,59 +49,41 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
-  growth_weight: number;
-  growth_floor: number;
-  growth_cap: number;
-  maturity_floor: number;
-  maturity_range: number;
-  maturity_days: number;
-  unknown_age_days: number;
-  chain_weight: number;
-  min_category_sample: number;
-  shrinkage_prior: number;
-  median_floor: number;
-  median_cap: number;
-  multiple_floor: number;
-  multiple_cap: number;
+  /** An exploratory change to the peer-fitted log(TVL) slope. */
+  size_slope_adjustment: number;
+  /** A scenario multiplier applied after the peer fit. */
+  value_scale: number;
+  /** TVL at which the fitted mcap/TVL multiple is anchored. */
+  anchor_tvl_usd: number;
 }
 
 export const MODEL: ModelConstants = {
-  growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
-  maturity_days: 1095,
-  unknown_age_days: 365,
-  chain_weight: 0.1,
-  min_category_sample: 3,
-  shrinkage_prior: 5,
-  median_floor: 0.02,
-  median_cap: 1.5,
-  multiple_floor: 0.05,
-  multiple_cap: 1.0,
+  size_slope_adjustment: 0,
+  value_scale: 1,
+  anchor_tvl_usd: 100_000_000,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
 
-/** One row of the calibration table the dashboard shows. */
-export interface CalibrationRow {
-  category: string;
-  live_protocols: number;
-  median_mcap_tvl: number | null;
-  multiple: number;
-}
-
-/** The calibration: the global median and one multiple per category, from the snapshot's live set. */
+/** A snapshot-fitted size curve and held-out evaluation. */
 export interface Calibration {
-  global_median: number;
+  anchor_tvl_usd: number;
+  slope: number;
+  log_intercept: number;
+  global_median_multiple: number;
   live_count: number;
-  by_category: CalibrationRow[];
-  multiple_for: Record<string, number>;
+  leave_one_out_count: number;
+  leave_one_out_median_miss_factor: number;
+  global_leave_one_out_median_miss_factor: number;
+  walk_forward_count: number;
+  walk_forward_median_miss_factor: number;
+  global_walk_forward_median_miss_factor: number;
+  peer_error_low_factor: number;
+  peer_error_high_factor: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -127,14 +109,10 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
-  model: {
-    base_multiple: number;
-    growth_pct: number;
-    growth_multiplier: number;
-    maturity_multiplier: number;
-    chain_multiplier: number;
-    age_days: number | null;
-  };
+  base_multiple: number;
+  peer_range_low_usd: number;
+  peer_range_high_usd: number;
+  model: { size_slope: number; peer_error_low_factor: number; peer_error_high_factor: number };
   farm_steps: string[];
 }
 
@@ -152,9 +130,9 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   base_multiple: number;
-  growth_multiplier: number;
-  maturity_multiplier: number;
-  chain_multiplier: number;
+  peer_range_low_usd: number;
+  peer_range_high_usd: number;
+  size_slope: number;
   farm_steps: string[];
 }
 
@@ -220,50 +198,82 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
 }
 
 /**
- * The base multiple, calibrated from the snapshot's live-token protocols: for each category with
- * enough live protocols, the median mcap/TVL, winsorized and shrunk toward the global median. A
- * category with too few live protocols takes the global median, so no row's multiple rests on one
- * protocol's ratio. The table is returned whole so the dashboard can show its working.
+ * Fit a robust log(mcap/TVL) power curve from listed-token peers. Each leave-one-out
+ * prediction omits its target, and the ordered split uses only strictly earlier listings.
  */
 export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
-  const live = snapshot.protocols.filter(
-    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0,
-  );
-  const ratios = live.map((p) => p.mcap_usd! / p.tvl_usd);
-  const globalRaw = median(ratios) ?? 0.25;
-  const globalMedian = Math.min(model.median_cap, Math.max(model.median_floor, globalRaw));
+  const anchor = model.anchor_tvl_usd;
+  const live = snapshot.protocols
+    .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 && p.listed_at !== null &&
+      !['CEX', 'Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC'].includes(p.category ?? ''))
+    .sort((a, b) => a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug.localeCompare(b.slug));
 
-  const byCategory = new Map<string, number[]>();
-  for (const p of live) {
-    if (p.category === null) continue;
-    const list = byCategory.get(p.category) ?? [];
-    list.push(p.mcap_usd! / p.tvl_usd);
-    byCategory.set(p.category, list);
+  type Point = { p: SnapshotProtocol; x: number; y: number; date: string };
+  const points: Point[] = live.map((p) => ({
+    p, x: Math.log(p.tvl_usd / anchor), y: Math.log(p.mcap_usd! / p.tvl_usd), date: p.listed_at!,
+  }));
+  const globalLog = median(points.map((r) => r.y)) ?? Math.log(0.25);
+
+  const fit = (rows: Point[]): { slope: number; intercept: number } => {
+    if (rows.length < 2) return { slope: 0, intercept: median(rows.map((r) => r.y)) ?? globalLog };
+    const slopes: number[] = [];
+    for (let i = 0; i < rows.length; i++) for (let j = i + 1; j < rows.length; j++) {
+      const dx = rows[i]!.x - rows[j]!.x;
+      if (Math.abs(dx) > 1e-9) slopes.push((rows[i]!.y - rows[j]!.y) / dx);
+    }
+    const slope = Math.max(-1.5, Math.min(1.5, median(slopes) ?? 0));
+    return { slope, intercept: median(rows.map((r) => r.y - slope * r.x)) ?? globalLog };
+  };
+  const quantile = (values: number[], q: number): number => {
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const at = (sorted.length - 1) * q, lo = Math.floor(at), hi = Math.ceil(at);
+    return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
+  };
+  const miss = (actual: number, predicted: number): number => Math.exp(Math.abs(actual - predicted));
+  const globalPrediction = (train: Point[], point: Point): number =>
+    Math.log(point.p.tvl_usd) + (median(train.map((r) => r.y)) ?? globalLog);
+
+  const loo: number[] = [], looGlobal: number[] = [], signedErrors: number[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const train = points.filter((_, j) => j !== i);
+    if (train.length < 2) continue;
+    const f = fit(train), point = points[i]!;
+    const prediction = Math.log(point.p.tvl_usd) + f.intercept + f.slope * point.x;
+    const actual = Math.log(point.p.mcap_usd!);
+    loo.push(miss(actual, prediction));
+    looGlobal.push(miss(actual, globalPrediction(train, point)));
+    signedErrors.push(actual - prediction);
   }
 
-  const multipleFor = (category: string | null): number => {
-    if (category === null) return globalMedian;
-    const list = byCategory.get(category);
-    if (list === undefined || list.length < model.min_category_sample) return globalMedian;
-    const catMedian = Math.min(model.median_cap, Math.max(model.median_floor, median(list) ?? globalMedian));
-    const weight = list.length / (list.length + model.shrinkage_prior);
-    const shrunk = weight * catMedian + (1 - weight) * globalMedian;
-    return Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk));
+  const walk: number[] = [], walkGlobal: number[] = [];
+  const cutoff = points[Math.floor(points.length * 0.42)]?.date;
+  if (cutoff) for (const point of points) {
+    if (point.date <= cutoff) continue;
+    const train = points.filter((r) => r.date < point.date);
+    if (train.length < 20) continue;
+    const f = fit(train), prediction = Math.log(point.p.tvl_usd) + f.intercept + f.slope * point.x;
+    const actual = Math.log(point.p.mcap_usd!);
+    walk.push(miss(actual, prediction));
+    walkGlobal.push(miss(actual, globalPrediction(train, point)));
+  }
+
+  const full = fit(points);
+  return {
+    anchor_tvl_usd: anchor,
+    slope: full.slope,
+    log_intercept: full.intercept,
+    global_median_multiple: Math.exp(globalLog),
+    live_count: points.length,
+    leave_one_out_count: loo.length,
+    leave_one_out_median_miss_factor: median(loo) ?? 1,
+    global_leave_one_out_median_miss_factor: median(looGlobal) ?? 1,
+    walk_forward_count: walk.length,
+    walk_forward_median_miss_factor: median(walk) ?? 1,
+    global_walk_forward_median_miss_factor: median(walkGlobal) ?? 1,
+    peer_error_low_factor: Math.max(0.01, Math.exp(quantile(signedErrors, 0.1))),
+    peer_error_high_factor: Math.min(100, Math.max(1, Math.exp(quantile(signedErrors, 0.9)))),
   };
-
-  const rows: CalibrationRow[] = [...byCategory.entries()]
-    .map(([category, list]) => ({
-      category,
-      live_protocols: list.length,
-      median_mcap_tvl: list.length >= model.min_category_sample ? round4(Math.min(model.median_cap, Math.max(model.median_floor, median(list) ?? globalMedian))) : null,
-      multiple: round4(multipleFor(category)),
-    }))
-    .sort((a, b) => b.live_protocols - a.live_protocols || (a.category < b.category ? -1 : 1));
-
-  const multiple_for: Record<string, number> = {};
-  for (const row of rows) multiple_for[row.category] = row.multiple;
-
-  return { global_median: round4(globalMedian), live_count: live.length, by_category: rows, multiple_for };
 }
 
 /** The multipliers and the implied value one protocol gets under `model` and `calibration`. */
@@ -272,18 +282,16 @@ export function impliedValue(
   asOf: string,
   model: ModelConstants,
   calibration: Calibration,
-): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
+): { implied: number; multiple: number; slope: number; low: number; high: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + model.maturity_range * Math.sqrt(Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days);
-  const chainMult = 1 + model.chain_weight * Math.log(Math.max(protocol.chains.length, 1));
-  const multiple = protocol.category === null ? calibration.global_median : (calibration.multiple_for[protocol.category] ?? calibration.global_median);
-  const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(1, Math.min(100_000_000_000_000, Math.round(base * growthMult * maturityMult * chainMult)));
-  return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
+  const slope = calibration.slope + model.size_slope_adjustment;
+  const x = Math.log(protocol.tvl_usd / calibration.anchor_tvl_usd);
+  const multiple = Math.max(0.0001, Math.min(10,
+    Math.exp(calibration.log_intercept + slope * x) * model.value_scale));
+  const cap = (factor: number): number => Math.max(1, Math.min(100_000_000_000_000,
+    Math.round(protocol.tvl_usd * multiple * factor)));
+  return { implied: cap(1), multiple, slope, low: cap(calibration.peer_error_low_factor),
+    high: cap(calibration.peer_error_high_factor), age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -358,13 +366,13 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL, ca
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    base_multiple: round4(s.multiple),
+    peer_range_low_usd: s.low,
+    peer_range_high_usd: s.high,
     model: {
-      base_multiple: round4(s.multiple),
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      chain_multiplier: round4(s.chainMult),
-      age_days: s.age,
+      size_slope: round4(s.slope),
+      peer_error_low_factor: round4(calibration.peer_error_low_factor),
+      peer_error_high_factor: round4(calibration.peer_error_high_factor),
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -554,10 +562,10 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    base_multiple: row.model.base_multiple,
-    growth_multiplier: row.model.growth_multiplier,
-    maturity_multiplier: row.model.maturity_multiplier,
-    chain_multiplier: row.model.chain_multiplier,
+    base_multiple: row.base_multiple,
+    peer_range_low_usd: row.peer_range_low_usd,
+    peer_range_high_usd: row.peer_range_high_usd,
+    size_slope: row.model.size_slope,
     farm_steps: row.farm_steps,
   };
 }

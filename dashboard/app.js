@@ -11,7 +11,7 @@
   var MODEL = DATA.model;
   var state = {
     q: '', category: 'all', chain: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null,
-    sandbox: { growth_weight: MODEL.growth_weight, maturity_floor: MODEL.maturity_floor, chain_weight: MODEL.chain_weight, multiple_scale: 1 }
+    sandbox: { size_slope_adjustment: MODEL.size_slope_adjustment, value_scale: MODEL.value_scale }
   };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
@@ -33,24 +33,20 @@
   }
   function fmtMult(n) { return 'x' + n.toFixed(2); }
 
-  // The model in one function: the page recomputes a row from the snapshot figures and checks the
-  // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  // The sandbox passes its own constants; the board's constants reproduce board.json exactly.
+  // Recompute estimates from each row's fitted peer multiple. Filters preserve the global rank.
   function impliedOf(row, c) {
-    var growth = Math.min(MODEL.growth_cap, Math.max(MODEL.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * c.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? MODEL.unknown_age_days : row.age_days;
-    var maturity = c.maturity_floor + MODEL.maturity_range * Math.sqrt(Math.min(Math.max(age, 0), MODEL.maturity_days) / MODEL.maturity_days);
-    var chainMult = 1 + c.chain_weight * Math.log(Math.max((row.chains || []).length, 1));
-    var multiple = row.base_multiple * c.multiple_scale;
-    return Math.max(1, Math.min(100000000000000, Math.round(row.tvl_usd * multiple * growthMult * maturity * chainMult)));
+    var x = Math.log(row.tvl_usd / DATA.calibration.anchor_tvl_usd);
+    var slope = DATA.calibration.slope + c.size_slope_adjustment;
+    var multiple = Math.max(0.0001, Math.min(10,
+      Math.exp(DATA.calibration.log_intercept + slope * x) * c.value_scale));
+    return Math.max(1, Math.min(100000000000000, Math.round(row.tvl_usd * multiple)));
   }
   function boardConstants() {
-    return { growth_weight: MODEL.growth_weight, maturity_floor: MODEL.maturity_floor, chain_weight: MODEL.chain_weight, multiple_scale: 1 };
+    return { size_slope_adjustment: MODEL.size_slope_adjustment, value_scale: MODEL.value_scale };
   }
   function sandboxActive() {
     var s = state.sandbox;
-    return s.growth_weight !== MODEL.growth_weight || s.maturity_floor !== MODEL.maturity_floor || s.chain_weight !== MODEL.chain_weight || s.multiple_scale !== 1;
+    return s.size_slope_adjustment !== MODEL.size_slope_adjustment || s.value_scale !== MODEL.value_scale;
   }
 
   function el(tag, attrs) {
@@ -75,15 +71,13 @@
   }
 
   function readHash() {
-    var hash = window.location.hash.replace(/^#/, '');
-    if (!hash) return;
-    var params = new URLSearchParams(hash);
-    if (params.get('q')) state.q = params.get('q');
-    if (params.get('p')) state.selected = params.get('p');
-    if (params.get('category')) state.category = params.get('category');
-    if (params.get('chain')) state.chain = params.get('chain');
-    if (params.get('tab')) state.tab = params.get('tab');
-    if (params.get('sort')) state.sort = params.get('sort');
+    var params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    state.q = params.get('q') || '';
+    state.selected = params.get('p') || null;
+    state.category = params.get('category') || 'all';
+    state.chain = params.get('chain') || 'all';
+    state.tab = params.get('tab') || 'pre-token';
+    state.sort = params.get('sort') || 'implied';
   }
   function writeHash() {
     var params = new URLSearchParams();
@@ -108,13 +102,23 @@
       return hay.indexOf(q) >= 0;
     });
   }
-  // The rows as the table shows them: with the sandbox off, the board's own order; with it on, the
-  // rows re-scored under the sandbox constants and re-ranked, each carrying its sandbox value.
+  // Score the full board first so filtering and secondary sorts never change a protocol's rank.
   function viewRows() {
-    var list = filteredRows();
     var active = sandboxActive();
-    var scored = list.map(function (r) {
-      return { row: r, value: active ? impliedOf(r, state.sandbox) : r.implied_value_usd };
+    var q = state.q.trim().toLowerCase();
+    var scored = DATA.rows.map(function (r) {
+      var value = active ? impliedOf(r, state.sandbox) : r.implied_value_usd;
+      var scale = r.implied_value_usd > 0 ? value / r.implied_value_usd : 1;
+      return { row: r, value: value, low: r.peer_range_low_usd * scale, high: r.peer_range_high_usd * scale };
+    });
+    scored.slice().sort(function (a, b) { return b.value - a.value || (a.row.slug < b.row.slug ? -1 : 1); })
+      .forEach(function (item, i) { item.score_rank = i + 1; });
+    scored = scored.filter(function (item) {
+      var r = item.row;
+      if (state.category !== 'all' && (r.category || 'Other') !== state.category) return false;
+      if (state.chain !== 'all' && (r.chains || []).indexOf(state.chain) < 0) return false;
+      if (!q) return true;
+      return [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase().indexOf(q) >= 0;
     });
     var key = state.sort;
     scored.sort(function (a, b) {
@@ -146,15 +150,16 @@
   function lede() {
     return el('section', { class: 'lede' },
       el('div', null,
-        el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by implied value' }),
-        el('p', { text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The radar also surfaces ' + DATA.above_floor_size + ' pre-token protocols above that floor the watchlist leaves out, and ' + DATA.early_size + ' below it. Implied value is a model, calibrated on the market, not a promise.' })
+        el('h1', { text: DATA.board_size + ' pre-token protocols ranked by a market-cap peer curve' }),
+        el('p', { text: 'The board covers all ' + DATA.watchlist_size + ' watchlist protocols and adds ' + DATA.above_floor_size + ' above-floor and ' + DATA.early_size + ' early protocols. Estimates use listed-token peers from the same frozen DefiLlama snapshot; launch timing and future token value are not observed.' })
       ),
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Above the floor, off the watchlist' }), el('b', { text: String(DATA.above_floor_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Total implied value' }), el('b', { text: fmtUsd(DATA.total_implied_usd) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Median peer miss · leave one out' }), el('b', { text: fmtMult(DATA.calibration.leave_one_out_median_miss_factor) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Median peer miss · earlier listings' }), el('b', { text: fmtMult(DATA.calibration.walk_forward_median_miss_factor) })),
         el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
       )
     );
@@ -162,10 +167,10 @@
 
   function slider(key, label, min, max, step) {
     var input = el('input', { type: 'range', min: String(min), max: String(max), step: String(step), value: String(state.sandbox[key]), 'aria-label': label });
-    var value = el('b', { text: key === 'multiple_scale' ? fmtMult(state.sandbox[key]) : state.sandbox[key].toFixed(2) });
+    var value = el('b', { text: key === 'value_scale' ? fmtMult(state.sandbox[key]) : state.sandbox[key].toFixed(2) });
     input.addEventListener('input', function () {
       state.sandbox[key] = parseFloat(input.value);
-      value.textContent = key === 'multiple_scale' ? fmtMult(state.sandbox[key]) : state.sandbox[key].toFixed(2);
+      value.textContent = key === 'value_scale' ? fmtMult(state.sandbox[key]) : state.sandbox[key].toFixed(2);
       render();
     });
     return el('div', { class: 'slider' }, el('label', null, el('span', { text: label }), value), input);
@@ -177,14 +182,12 @@
     return el('section', { class: 'panel sandbox' },
       el('div', { class: 'sandbox-head' },
         el('h2', { text: 'Model sandbox' }),
-        active ? el('span', { class: 'sandbox-badge', text: 'sandbox: board re-ranked live' }) : el('span', { class: 'sub', text: 'drag a slider to re-rank the board' })
+        active ? el('span', { class: 'sandbox-badge', text: 'scenario: board re-ranked live' }) : el('span', { class: 'sub', text: 'adjust the fitted curve to explore scenarios' })
       ),
-      el('p', { class: 'sub', text: 'The same function scores every row. Change a constant and the table re-scores all ' + DATA.board_size + ' rows under it, so you can see what the ranking rests on. Reset returns to the model board.json carries.' }),
+      el('p', { class: 'sub', text: 'Rankings use a Theil–Sen fit of log(market cap / TVL) against log(TVL / $' + fmtUsd(DATA.calibration.anchor_tvl_usd).replace('$', '') + '). Scenarios adjust the fitted slope or cap analogue; filters preserve global rank.' }),
       el('div', { class: 'sliders' },
-        slider('growth_weight', 'Growth weight', 0, 1, 0.05),
-        slider('maturity_floor', 'Maturity floor', 0.3, 0.9, 0.05),
-        slider('chain_weight', 'Chain weight', 0, 0.25, 0.01),
-        slider('multiple_scale', 'Base multiple scale', 0.5, 2, 0.05)
+        slider('size_slope_adjustment', 'Size slope adjustment', -0.5, 0.5, 0.05),
+        slider('value_scale', 'Value scenario', 0.5, 2, 0.05)
       ),
       el('div', null, reset)
     );
@@ -241,9 +244,9 @@
       var r = item.row;
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
       var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
-      var rankCell = active
-        ? el('td', { class: 'num' }, el('div', null, el('span', { text: String(i + 1) }), el('div', { class: 'sub', text: 'board #' + r.rank })))
-        : el('td', { class: 'num', text: String(r.rank) });
+      var rankCell = active || state.sort !== 'implied'
+        ? el('td', { class: 'num' }, el('div', null, el('span', { text: String(item.score_rank) }), el('div', { class: 'sub', text: 'board #' + r.rank })))
+        : el('td', { class: 'num', text: String(item.score_rank) });
       var tr = el('tr', {
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
@@ -258,11 +261,11 @@
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
-        el('td', { class: 'num', text: String((r.chains || []).length) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((item.value / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(item.value) })
         )),
+        el('td', { class: 'peer-band', text: fmtUsd(item.low) + ' – ' + fmtUsd(item.high) }),
         el('td', { class: 'num', text: fmtMult(r.base_multiple) }),
         el('td', null, el('span', { class: 'status', text: 'no token' }))
       );
@@ -278,9 +281,9 @@
             sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
-            sortHeader('chains', 'Chains'),
-            sortHeader('implied', 'Implied value'),
-            el('th', { scope: 'col', text: 'Multiple' }),
+            sortHeader('implied', 'Cap analogue'),
+            el('th', { scope: 'col', text: 'Peer error band' }),
+            el('th', { scope: 'col', text: 'Cap / TVL' }),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -313,35 +316,26 @@
   }
 
   function modelPanel() {
-    var m = DATA.model;
     var cal = DATA.calibration;
-    var top = cal.by_category.slice(0, 12);
-    var calibRows = top.map(function (c) {
-      return el('tr', null,
-        el('td', { text: c.category }),
-        el('td', { class: 'num', text: String(c.live_protocols) }),
-        el('td', { class: 'num', text: c.median_mcap_tvl === null ? 'too few live' : fmtMult(c.median_mcap_tvl) }),
-        el('td', { class: 'num', text: fmtMult(c.multiple) })
-      );
+    var rows = [
+      ["Leave one out", cal.leave_one_out_count, cal.leave_one_out_median_miss_factor, cal.global_leave_one_out_median_miss_factor],
+      ["Earlier listings only", cal.walk_forward_count, cal.walk_forward_median_miss_factor, cal.global_walk_forward_median_miss_factor]
+    ].map(function (r) {
+      return el("tr", null, el("td", { text: r[0] }), el("td", { class: "num", text: String(r[1]) }),
+        el("td", { class: "num", text: fmtMult(r[2]) }), el("td", { class: "num", text: fmtMult(r[3]) }));
     });
-    return el('section', { class: 'panel model' },
-      el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
-      el('div', { class: 'formula' },
-        'implied = round( tvl_usd x multiple[category] x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + ' + m.maturity_range + ' x sqrt(min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ')) x (1 + ' + m.chain_weight + ' x ln(chains)) )'
-      ),
-      el('p', { class: 'sub', text: 'The multiple is calibrated from the snapshot itself: the median mcap/TVL of the live-token protocols in each category, shrunk toward the global median of ' + fmtMult(cal.global_median) + ' (from ' + cal.live_count + ' live protocols). A category with fewer than ' + m.min_category_sample + ' live protocols takes the global median, so no multiple rests on one protocol. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
-      el('h3', { text: 'Calibration: the multiple each category gets' }),
-      el('div', { class: 'table-wrap' },
-        el('table', { class: 'calib' },
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Live protocols' }), el('th', { scope: 'col', text: 'Median mcap / TVL' }), el('th', { scope: 'col', text: 'Multiple used' }))),
-          el('tbody', null, calibRows)
-        )
-      ),
-      el('p', { class: 'sub', text: 'The board ranks every pre-token protocol that is not a wrapped, staked or bridged product of a token that already trades, and not an exchange: the watchlist rule, applied to the whole snapshot. A protocol is called pre-token when its record carries no market cap, no CoinGecko id and no symbol; the record is not proof a token does not exist.' })
+    return el("section", { class: "panel model" },
+      el("h2", { text: "Model audit" }),
+      el("p", { class: "sub", text: "A robust size curve fits listed-token peers in this frozen snapshot. It does not claim to predict if or when a pre-token protocol launches." }),
+      el("div", { class: "formula", text: "Cap analogue = TVL x exp(intercept + beta x ln(TVL / " + fmtUsd(cal.anchor_tvl_usd) + ")); beta = " + cal.slope.toFixed(3) }),
+      el("p", { class: "sub", text: "Fit: median pairwise slope of log(mcap / TVL) against log(TVL); intercept: median residual. " + cal.live_count + " listed-token peers have positive TVL and market cap and a known listing date. The 10th-90th percentile peer-error band comes from leave-one-out residuals; it is not a future-launch confidence interval." }),
+      el("h3", { text: "Held-out median valuation miss; lower is better" }),
+      el("div", { class: "table-wrap" }, el("table", { class: "calib validation" },
+        el("thead", null, el("tr", null, el("th", { scope: "col", text: "Evaluation" }), el("th", { scope: "col", text: "Peers" }), el("th", { scope: "col", text: "Radar-3 curve" }), el("th", { scope: "col", text: "Global median baseline" }))),
+        el("tbody", null, rows))),
+      el("p", { class: "sub", text: "The ordered test predicts later listing cohorts using strictly earlier peers. This one cross-section is not a launch-history backtest. Pre-token means the snapshot has no market cap, CoinGecko id, or symbol recorded; it is not proof that a token does not exist." })
     );
   }
-
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
 
@@ -354,33 +348,33 @@
     var active = sandboxActive();
     var recomputed = impliedOf(row, boardConstants());
     var sandboxValue = active ? impliedOf(row, state.sandbox) : null;
+    var displayedValue = active ? sandboxValue : row.implied_value_usd;
+    var rangeScale = row.implied_value_usd > 0 ? displayedValue / row.implied_value_usd : 1;
     var check = recomputed === row.implied_value_usd
       ? 'The page recomputes this row as ' + fmtUsd(recomputed) + ', the same number board.json carries.'
       : 'The page recomputes this row as ' + fmtUsd(recomputed) + ', which differs from the board: the data would be stale.';
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
-        el('span', { class: 'brand-name', text: 'RANK ' + row.rank + ' OF ' + DATA.board_size + (active ? '  |  SANDBOX ' + fmtUsd(sandboxValue) : '') }),
+        el('span', { class: 'brand-name', text: 'RANK ' + row.rank + ' OF ' + DATA.board_size + (active ? '  |  SCENARIO ' + fmtUsd(sandboxValue) : '') }),
         el('h2', { id: 'detail-title', text: row.name }),
         el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') })
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
-      el('h3', { text: 'Implied value' }),
+      el('h3', { text: 'Market-cap peer analogue' }),
       el('div', { class: 'equation' },
-        el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Base multiple (' + (row.category || 'Other') + ')' }), el('b', { class: 'num', text: fmtMult(row.base_multiple) })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) })),
-        el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(row.maturity_multiplier) })),
-        el('div', null, el('span', { text: 'Chains (' + (row.chains || []).length + ')' }), el('b', { class: 'num', text: fmtMult(row.chain_multiplier) })),
-        el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
+        el('div', null, el('span', { text: 'TVL in frozen snapshot' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
+        el('div', null, el('span', { text: 'Fitted cap / TVL multiple at this size' }), el('b', { class: 'num', text: fmtMult(row.base_multiple) })),
+        el('div', null, el('span', { text: 'Fitted size slope' }), el('b', { class: 'num', text: row.size_slope.toFixed(3) })),
+        el('div', null, el('span', { text: 'Seven-day TVL change (context only)' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
+        el('div', null, el('span', { text: 'Peer-error band, leave-one-out' }), el('b', { class: 'num', text: fmtUsd(row.peer_range_low_usd * rangeScale) + ' - ' + fmtUsd(row.peer_range_high_usd * rangeScale) })),
+        el('div', null, el('span', { text: active ? 'Scenario cap analogue' : 'Cap analogue' }), el('b', { class: 'num', text: fmtUsd(displayedValue) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. ' + check + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': ' + check + ' The peer band is not a launch forecast or confidence interval. Age, chain count and recent growth are context only, not model inputs.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
-      el('h3', { text: 'Farm plan' }),
+      el('h3', { text: 'Activity plan (heuristic)' }),
       el('ol', { class: 'steps' }, row.farm_steps.map(function (s) {
         var at = s.indexOf(' Cost: ');
         var action = at >= 0 ? s.slice(0, at) : s;
@@ -396,7 +390,7 @@
   }
 
   function footer() {
-    return el('p', { class: 'foot', text: 'Token Radar ranks protocols by an implied value its model states from the snapshot of ' + DATA.as_of + '. It does not predict whether or when a protocol issues a token. A protocol is shown as pre-token when its DefiLlama record carries no token; the record is not proof it has none. Farm plans are a starting point, not financial advice.' });
+    return el('p', { class: 'foot', text: 'Snapshot: ' + DATA.as_of + '. The peer curve estimates a market-cap analogue from listed-token peers. It does not estimate launch odds, timing, future returns or incentives. Missing token fields are not proof that a token does not exist. Activity plans are generic scenarios; verify official incentives, contracts, fees and risks before acting.' });
   }
 
   function render() {
@@ -404,10 +398,10 @@
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     shell.appendChild(lede());
+    shell.appendChild(modelPanel());
     shell.appendChild(sandboxPanel());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
     shell.appendChild(footer());
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
@@ -420,9 +414,8 @@
   // A hash change (back/forward, or a pasted deep link) re-reads the state and re-renders, so a
   // detail link opens its drawer even when the page is already loaded.
   window.addEventListener('hashchange', function () {
-    var hadSelected = state.selected;
     readHash();
-    if (state.selected !== hadSelected || !state.selected) render();
+    render();
   });
   window.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && dialog.open) dialog.close();
